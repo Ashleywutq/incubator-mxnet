@@ -49,6 +49,21 @@ using mkldnn::use_scale_shift;
 using mkldnn::forward_training;
 using mkldnn::forward_inference;
 
+struct BatchNormFusionParam : public dmlc::Parameter<BatchNormFusionParam> {
+  // When adding more members into this clss, please double check GetHash()
+  // won't overflow.
+  bool with_relu;
+  DMLC_DECLARE_PARAMETER(BatchNormFusionParam) {
+    DMLC_DECLARE_FIELD(with_relu).set_default(false)
+    .describe("Add post relu");
+  }
+  const int GetHash() const {
+    int hash = 0;
+    hash = hash * 2 + this->with_relu ? 1 : 0;
+    return hash;
+  }
+};
+
 inline static unsigned _GetFlags(const std::vector<NDArray> &in_data,
                                  const std::vector<NDArray> &aux_states,
                                  const BatchNormParam &param, bool is_train) {
@@ -69,17 +84,28 @@ template <typename DType>
 inline static t_bn_f_pdesc _GetFwd(const mkldnn::memory &data_mem,
                                    bool is_train,
                                    DType eps,
-                                   unsigned flags) {
+                                   unsigned flags,
+				   const BatchNormFusionParam &fusion_param) {
   auto data_mpd   = data_mem.get_primitive_desc();
   auto data_md    = data_mpd.desc();
   auto engine     = CpuEngine::Get()->get_engine();
 
+  mkldnn::primitive_attr attr;
+  mkldnn::post_ops ops;
+  if (fusion_param.with_relu) {
+    float scale = 1.0f;            // for fp32, scale is 1.
+    float alpha = 0.0f;            // negative slope for mkldnn_eltwise_relu.
+    float beta = 1.0f;             // ignored for mkldnn_eltwise_relu.
+    ops.append_eltwise(scale, eltwise_relu, alpha, beta);
+  }
+  attr.set_post_ops(ops);
+
   if (is_train) {
     t_bn_f_desc bnFwd_desc(forward_training, data_md, eps, flags);
-    return t_bn_f_pdesc(bnFwd_desc, engine);
+    return t_bn_f_pdesc(bnFwd_desc, attr, engine);
   } else {
     t_bn_f_desc bnFwd_desc(forward_inference, data_md, eps, flags);
-    return t_bn_f_pdesc(bnFwd_desc, engine);
+    return t_bn_f_pdesc(bnFwd_desc, attr, engine);
   }
 }
 
@@ -87,7 +113,8 @@ template <typename DType>
 inline static t_bn_b_pdesc _GetBwd(const mkldnn::memory &data_mem,
                                    const mkldnn::memory &diff_mem,
                                    DType eps,
-                                   unsigned flags) {
+                                   unsigned flags,
+				   const BatchNormFusionParam &fusion_param) {
   auto data_mpd   = data_mem.get_primitive_desc();
   auto data_md    = data_mpd.desc();
   auto diff_mpd   = diff_mem.get_primitive_desc();
@@ -95,7 +122,7 @@ inline static t_bn_b_pdesc _GetBwd(const mkldnn::memory &data_mem,
   auto engine     = CpuEngine::Get()->get_engine();
 
   t_bn_b_desc  bnBwd_desc(mkldnn::prop_kind::backward, diff_md, data_md, eps, flags);
-  return t_bn_b_pdesc(bnBwd_desc, engine, _GetFwd(data_mem, true, eps, flags));
+  return t_bn_b_pdesc(bnBwd_desc, engine, _GetFwd(data_mem, true, eps, flags, fusion_param));
 }
 
 typedef ParamOpSign<BatchNormParam> MKLDNNBNSignature;
@@ -181,7 +208,7 @@ class MKLDNNBNForward {
 };
 
 template<typename DType>
-static MKLDNNBNForward &GetBNForward(const BatchNormParam& param,
+static MKLDNNBNForward &GetBNForward(const nnvm::NodeAttrs &attrs,
                                      const OpContext &ctx, const NDArray &in_data,
                                      unsigned flags) {
 #if DMLC_CXX11_THREAD_LOCAL
@@ -189,14 +216,18 @@ static MKLDNNBNForward &GetBNForward(const BatchNormParam& param,
 #else
   static MX_THREAD_LOCAL std::unordered_map<MKLDNNBNSignature, MKLDNNBNForward, OpHash> fwds;
 #endif
+  const BatchNormParam &param = nnvm::get<BatchNormParam>(attrs.parsed);
+  BatchNormFusionParam fusion_param;
+  fusion_param.Init(attrs.dict, dmlc::parameter::kAllowUnknown);
   MKLDNNBNSignature key(param);
+  key.AddSign(fusion_param.GetHash());
   key.AddSign(ctx.is_train);
   key.AddSign(in_data);
 
   auto it = fwds.find(key);
   if (it == fwds.end()) {
     auto fwd_pd = _GetFwd(*in_data.GetMKLDNNData(), ctx.is_train,
-                          (DType) param.eps, flags);
+                          (DType) param.eps, flags, fusion_param);
     MKLDNNBNForward fwd(fwd_pd, ctx.is_train);
     auto ins_ret = fwds.insert(std::pair<MKLDNNBNSignature, MKLDNNBNForward>(
             key, fwd));
@@ -207,16 +238,19 @@ static MKLDNNBNForward &GetBNForward(const BatchNormParam& param,
 }
 
 template <typename DType>
-void MKLDNNBatchNormForward(const OpContext &ctx, const BatchNormParam &param,
+void MKLDNNBatchNormForward(const OpContext &ctx, const nnvm::NodeAttrs &attrs,
                             const std::vector<NDArray>   &in_data,
                             const std::vector<OpReqType> &req,
                             const std::vector<NDArray>   &out_data,
                             const std::vector<NDArray>   &aux_states) {
   TmpMemMgr::Get()->Init(ctx.requested[batchnorm::kTempSpace]);
+  const BatchNormParam &param = nnvm::get<BatchNormParam>(attrs.parsed);
+  BatchNormFusionParam fusion_param;
+  fusion_param.Init(attrs.dict, dmlc::parameter::kAllowUnknown);
   unsigned flags      = _GetFlags(in_data, aux_states, param, ctx.is_train);
   const NDArray &data = in_data[batchnorm::kData];
 
-  auto &fwd = GetBNForward<DType>(param, ctx, data, flags);
+  auto &fwd = GetBNForward<DType>(attrs, ctx, data, flags);
   const NDArray &out  = out_data[batchnorm::kOut];
 
   // for output memory
@@ -344,7 +378,7 @@ class MKLDNNBNBackward {
 
 template <typename DType>
 static MKLDNNBNBackward &GetBNBackward(
-    const BatchNormParam &param, const OpContext &ctx, const NDArray &in_data,
+    const nnvm::NodeAttrs &attrs, const OpContext &ctx, const NDArray &in_data,
     const mkldnn::memory &in_mem, const NDArray &diff_data,
     const mkldnn::memory &diff_mem, unsigned flags) {
 #if DMLC_CXX11_THREAD_LOCAL
@@ -352,13 +386,16 @@ static MKLDNNBNBackward &GetBNBackward(
 #else
   static MX_THREAD_LOCAL std::unordered_map<MKLDNNBNSignature, MKLDNNBNBackward, OpHash> bwds;
 #endif
+  const BatchNormParam &param = nnvm::get<BatchNormParam>(attrs.parsed);
+  BatchNormFusionParam fusion_param;
+  fusion_param.Init(attrs.dict, dmlc::parameter::kAllowUnknown);
   MKLDNNBNSignature key(param);
   key.AddSign(in_data);
   key.AddSign(diff_data);
 
   auto it = bwds.find(key);
   if (it == bwds.end()) {
-    auto bwd_pd = _GetBwd(in_mem, diff_mem, param.eps, flags);
+    auto bwd_pd = _GetBwd(in_mem, diff_mem, param.eps, flags, fusion_param);
     MKLDNNBNBackward bwd(bwd_pd);
     auto ins_ret =
         bwds.insert(std::pair<MKLDNNBNSignature, MKLDNNBNBackward>(key, bwd));
@@ -369,7 +406,7 @@ static MKLDNNBNBackward &GetBNBackward(
 }
 
 template <typename DType>
-void MKLDNNBatchNormBackward(const OpContext &ctx, const BatchNormParam &param,
+void MKLDNNBatchNormBackward(const OpContext &ctx, const nnvm::NodeAttrs &attrs,
                              const std::vector<NDArray>    &out_grad,
                              const std::vector<NDArray>    &in_data,
                              const std::vector<NDArray>    &out_data,
@@ -377,6 +414,7 @@ void MKLDNNBatchNormBackward(const OpContext &ctx, const BatchNormParam &param,
                              const std::vector<NDArray>    &in_grad,
                              const std::vector<NDArray>    &aux_states) {
   TmpMemMgr::Get()->Init(ctx.requested[batchnorm::kTempSpace]);
+  const BatchNormParam &param = nnvm::get<BatchNormParam>(attrs.parsed);
   CHECK_EQ(out_grad.size(), 1U);
   CHECK_EQ(in_data.size(), 3U);
   CHECK_EQ(out_data.size(), 3U);
@@ -404,7 +442,7 @@ void MKLDNNBatchNormBackward(const OpContext &ctx, const BatchNormParam &param,
     data_mem = data.GetMKLDNNDataReorder(diff_mem->get_primitive_desc());
   else if (diff.IsDefaultData())
     diff_mem = diff.GetMKLDNNDataReorder(data_mem->get_primitive_desc());
-  auto &bwd = GetBNBackward<DType>(param, ctx, data, *data_mem, diff, *diff_mem, flags);
+  auto &bwd = GetBNBackward<DType>(attrs, ctx, data, *data_mem, diff, *diff_mem, flags);
   auto gradi_mem = const_cast<NDArray &>(gradIn).CreateMKLDNNData(data_mem->get_primitive_desc());
 
   if (flags & use_scale_shift) {

@@ -29,6 +29,7 @@
 #include "../elemwise_op_common.h"
 #include "../operator_common.h"
 #if MXNET_USE_MKLDNN == 1
+#include "./mkldnn/mkldnn_base-inl.h"
 #include "./mkldnn/mkldnn_batch_norm-inl.h"
 #endif
 
@@ -380,7 +381,7 @@ static bool BatchNormType(const nnvm::NodeAttrs& attrs,
 }
 
 #if MXNET_USE_MKLDNN == 1
-static inline bool SupportMKLDNNBN(const NDArray &input, const BatchNormParam &param) {
+inline bool SupportMKLDNNBN(const NDArray &input, const BatchNormParam &param) {
   TShape shape = input.shape();
   return SupportMKLDNN(input) && shape.ndim() == 4
       && param.axis == mxnet::op::batchnorm::DEFAULT_AXIS
@@ -402,7 +403,7 @@ void BatchNormComputeExCPU(const nnvm::NodeAttrs &attrs,
 
     if (inputs[0].dtype() == mshadow::kFloat32) {
       MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
-      MKLDNNBatchNormForward<float>(ctx, param, in_data, req, outputs, aux_states);
+      MKLDNNBatchNormForward<float>(ctx, attrs, in_data, req, outputs, aux_states);
       MKLDNN_OPCHECK_RUN(BatchNormCompute<cpu>, attrs, ctx, inputs, req, outputs);
       return;
     }
@@ -438,7 +439,7 @@ void BatchNormGradComputeExCPU(const nnvm::NodeAttrs &attrs,
 
     if (inputs[0].dtype() == mshadow::kFloat32) {
       MKLDNN_OPCHECK_INIT(true, outputs.size(), inputs, outputs);
-      MKLDNNBatchNormBackward<float>(ctx, param, out_grad, in_data,
+      MKLDNNBatchNormBackward<float>(ctx, attrs, out_grad, in_data,
                                      out_data, req, in_grad, aux_states);
       MKLDNN_OPCHECK_RUN(BatchNormGradCompute<cpu>, attrs, ctx, inputs, req, outputs);
       return;

@@ -152,10 +152,12 @@ struct ActivationParam;
 struct ConvolutionParam;
 struct DeconvolutionParam;
 struct SoftmaxParam;
+struct BatchNormParam;
 bool SupportMKLDNNAct(const ActivationParam& param);
 bool SupportMKLDNNConv(const ConvolutionParam& params, const NDArray &input);
 bool SupportMKLDNNDeconv(const DeconvolutionParam& params, const NDArray &input);
 bool SupportMKLDNNSoftmax(const SoftmaxParam& param);
+bool SupportMKLDNNBN(const NDArray &input, const BatchNormParam& param);
 }
 
 static int GetTypeSize(int dtype) {
