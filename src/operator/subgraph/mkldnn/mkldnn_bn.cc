@@ -151,7 +151,8 @@ NNVM_REGISTER_OP(_sg_mkldnn_bn)
                                      DefaultSubgraphOpMutableInputs)
       .set_attr<FResourceRequest>("FResourceRequest",
                                   DefaultSubgraphOpResourceRequest)
-      .set_attr<std::string>("key_var_num_args", "num_args");
+      .set_attr<std::string>("key_var_num_args", "num_args")
+      .set_attr<bool>("TIsMKLDNN", true);
 }  // namespace op
 }  // namespace mxnet
 #endif  // if MXNET_USE_MKLDNN == 1
